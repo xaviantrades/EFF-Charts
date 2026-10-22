@@ -70,7 +70,18 @@ const icon = (name, size = 24, stroke = 2) =>
 // ---- 2a) The symbols we offer. EDIT to add instruments. ----
 // digits  = decimals in the price      spread = in "points" (smallest price step)
 // contract= units per 1.00 lot         usdBase= true when USD is the FIRST currency (USDJPY...)
-
+const MARKET = [
+  { sym:'EURUSD', name:'Euro vs US Dollar',            digits:5, price:1.11990, spread:1,   contract:100000, usdBase:false },
+  { sym:'GBPUSD', name:'Great Britain Pound vs US Dollar', digits:5, price:1.33708, spread:0, contract:100000, usdBase:false },
+  { sym:'USDCHF', name:'US Dollar vs Swiss Franc',     digits:5, price:0.82218, spread:2,   contract:100000, usdBase:true  },
+  { sym:'USDJPY', name:'US Dollar vs Japanese Yen',    digits:3, price:157.003, spread:2,   contract:100000, usdBase:true  },
+  { sym:'USDCNH', name:'US Dollar vs Chinese Yuan',    digits:5, price:6.67385, spread:12,  contract:100000, usdBase:true  },
+  { sym:'AUDUSD', name:'Australian Dollar vs US Dollar', digits:5, price:0.70078, spread:1, contract:100000, usdBase:false },
+  { sym:'NZDUSD', name:'New Zealand Dollar vs US Dollar', digits:5, price:0.56781, spread:1, contract:100000, usdBase:false },
+  { sym:'USDCAD', name:'US Dollar vs Canadian Dollar', digits:5, price:1.40362, spread:1,   contract:100000, usdBase:true  },
+  { sym:'USDSEK', name:'US Dollar vs Swedish Krona',   digits:5, price:9.92560, spread:100, contract:100000, usdBase:true  },
+  { sym:'XAUUSD', name:'Gold vs US Dollar',            digits:2, price:2650.00, spread:25,  contract:100,    usdBase:false } // demo price
+];
 const MAP = {};
 const Q = {};
 MARKET.forEach(m => {
@@ -83,11 +94,6 @@ MARKET.forEach(m => {
     last: null, change: null, changePct: null, ready: false
   };
 });
-
-
-
-
-
 
 // ---- 2b) App state: everything the UI needs lives here ----
 const State = {
