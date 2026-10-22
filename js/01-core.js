@@ -82,18 +82,16 @@ const MARKET = [
   { sym:'USDSEK', name:'US Dollar vs Swedish Krona',   digits:5, price:9.92560, spread:100, contract:100000, usdBase:true  },
   { sym:'XAUUSD', name:'Gold vs US Dollar',            digits:2, price:2650.00, spread:25,  contract:100,    usdBase:false } // demo price
 ];
-const MAP = {};   // MAP['EURUSD'] -> its definition (fast lookup)
-const Q   = {};   // Q['EURUSD']   -> its LIVE quote {bid, ask, open, lo, hi, dir, time}
+const MAP = {};
+const Q = {};
 MARKET.forEach(m => {
-  m.point = Math.pow(10, -m.digits);   // smallest step, e.g. 0.00001
-  m.vol   = m.price * 0.00004;         // typical movement per tick (volatility)
+  m.point = Math.pow(10, -m.digits);
   MAP[m.sym] = m;
+  // These are hidden placeholders only; quotes are not displayed as live until received.
   Q[m.sym] = {
-    bid: m.price,
-    ask: +(m.price + m.spread * m.point).toFixed(m.digits),
-    open: m.price * (1 + (Math.random() - 0.5) * 0.008),  // pretend "today's open"
-    lo: m.price * 0.9955, hi: m.price * 1.0045,           // pretend day low / high
-    dir: 1, time: new Date()
+    bid: m.price, ask: +(m.price + m.spread * m.point).toFixed(m.digits),
+    open: m.price, lo: m.price, hi: m.price, dir: 0, time: new Date(),
+    last: null, change: null, changePct: null, ready: false
   };
 });
 
@@ -110,40 +108,140 @@ const State = {
 const log = msg => State.journal.unshift({ t: new Date(), msg });
 log('Terminal started');
 
-// ---- 2c) The FEED: pages subscribe to be told when prices change ----
+// ---- 2c) LIVE TRADINGVIEW FEED ----
+// Implements the quote-session WebSocket protocol used in the supplied index.html.
+// This endpoint is unofficial and may be restricted by TradingView.
+const TV_URL = "wss://data.tradingview.com/socket.io/websocket";
+const TV_SYMBOLS = {
+  EURUSD:"FX:EURUSD", GBPUSD:"FX:GBPUSD", USDCHF:"FX:USDCHF",
+  USDJPY:"FX:USDJPY", USDCNH:"FX:USDCNH", AUDUSD:"FX:AUDUSD",
+  NZDUSD:"FX:NZDUSD", USDCAD:"FX:USDCAD", USDSEK:"FX:USDSEK",
+  XAUUSD:"OANDA:XAUUSD"
+};
+const TV_TO_APP = Object.fromEntries(Object.entries(TV_SYMBOLS).map(([app,tv]) => [tv,app]));
+const TV_FIELDS = ["lp","bid","ask","ch","chp"];
 const Feed = {
-  subs: new Set(),
-  on(fn)  { this.subs.add(fn); return () => this.subs.delete(fn); }, // returns an "unsubscribe" function
-  emit()  { this.subs.forEach(fn => fn()); }
+  subs:new Set(), socket:null, quoteSession:null, reconnectTimer:null,
+  manuallyClosed:false, status:"disconnected",
+  on(fn) { this.subs.add(fn); return () => this.subs.delete(fn); },
+  emit() { this.subs.forEach(fn => { try { fn(); } catch (e) { console.error("Feed subscriber error:",e); } }); },
+  setStatus(status,message) {
+    this.status = status;
+    if (message) {
+      log("TradingView: " + message);
+      window.dispatchEvent(new CustomEvent("market-feed-status",{detail:{status,message}}));
+    }
+  },
+  frame(payload) { return `~m~${payload.length}~m~${payload}`; },
+  send(method,params) {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN)
+      this.socket.send(this.frame(JSON.stringify({m:method,p:params})));
+  },
+  randomSession(prefix) {
+    const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let result = prefix;
+    for (let i=0;i<12;i++) result += chars[Math.floor(Math.random()*chars.length)];
+    return result;
+  },
+  connect() {
+    if (this.socket && [WebSocket.OPEN,WebSocket.CONNECTING].includes(this.socket.readyState)) return;
+    this.manuallyClosed = false;
+    clearTimeout(this.reconnectTimer);
+    this.quoteSession = this.randomSession("qs_");
+    this.setStatus("connecting","connecting to quote WebSocket…");
+    let socket;
+    try { socket = new WebSocket(TV_URL); this.socket = socket; }
+    catch (error) { this.setStatus("error","WebSocket could not be created: "+error.message); this.scheduleReconnect(); return; }
+    socket.addEventListener("open",() => {
+      if (this.socket !== socket) return;
+      this.setStatus("connected","WebSocket connected; subscribing to market quotes.");
+      this.send("set_auth_token",["unauthorized_user_token"]);
+      this.send("quote_create_session",[this.quoteSession]);
+      this.send("quote_set_fields",[this.quoteSession,...TV_FIELDS]);
+      this.send("quote_add_symbols",[this.quoteSession,...Object.values(TV_SYMBOLS)]);
+    });
+    socket.addEventListener("message",event => this.handleRaw(String(event.data)));
+    socket.addEventListener("error",() => {
+      if (this.socket === socket) this.setStatus("error","WebSocket error; live prices may be unavailable.");
+    });
+    socket.addEventListener("close",event => {
+      if (this.socket === socket) this.socket = null;
+      this.setStatus("disconnected","connection closed ("+event.code+").");
+      if (!this.manuallyClosed) this.scheduleReconnect();
+    });
+  },
+  scheduleReconnect() {
+    if (this.manuallyClosed || this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => { this.reconnectTimer=null; this.connect(); },5000);
+  },
+  disconnect() {
+    this.manuallyClosed = true;
+    clearTimeout(this.reconnectTimer); this.reconnectTimer=null;
+    if (this.socket) { const socket=this.socket; this.socket=null; socket.close(); }
+    this.setStatus("disconnected","feed disconnected.");
+  },
+  handleRaw(raw) {
+    let pos=0;
+    while (pos<raw.length) {
+      if (raw.startsWith("~h~",pos)) {
+        const nextFrame=raw.indexOf("~m~",pos);
+        const heartbeat=nextFrame<0 ? raw.slice(pos) : raw.slice(pos,nextFrame);
+        if (this.socket && this.socket.readyState===WebSocket.OPEN) this.socket.send(heartbeat);
+        pos += heartbeat.length; continue;
+      }
+      const match=raw.slice(pos).match(/^~m~(\d+)~m~/);
+      if (!match) break;
+      const start=pos+match[0].length, end=start+Number(match[1]);
+      if (end>raw.length) break;
+      const payload=raw.slice(start,end); pos=end;
+      if (payload.startsWith("~h~")) {
+        if (this.socket && this.socket.readyState===WebSocket.OPEN) this.socket.send(payload);
+        continue;
+      }
+      let data; try { data=JSON.parse(payload); } catch { continue; }
+      if (data && data.m==="qsd") this.handleQuote(data.p);
+    }
+  },
+  handleQuote(params) {
+    if (!Array.isArray(params) || !params[1]) return;
+    const quote=params[1];
+    if (quote.s!=="ok") {
+      log("TradingView quote status: "+(quote.s||"unknown")+" for "+(quote.n||"unknown symbol"));
+      return;
+    }
+    const sym=TV_TO_APP[quote.n] || Object.keys(TV_SYMBOLS).find(key => quote.n===key);
+    if (!sym || !Q[sym]) return;
+    const values=quote.v||{}, q=Q[sym];
+    const num=value => {
+      if (value===undefined || value===null || value==="") return null;
+      const n=Number(value); return Number.isFinite(n) ? n : null;
+    };
+    const lp=num(values.lp), bid=num(values.bid), ask=num(values.ask);
+    const change=num(values.ch), changePct=num(values.chp);
+    if (lp===null && bid===null && ask===null) return;
+    const previous=q.last;
+    const mid=lp ?? (bid!==null && ask!==null ? (bid+ask)/2 : bid ?? ask);
+    q.bid=bid ?? lp ?? q.bid;
+    q.ask=ask ?? lp ?? q.ask;
+    if (previous!==null && mid!==null && mid!==previous) q.dir=mid>previous ? 1 : -1;
+    q.last=mid; q.change=change; q.changePct=changePct;
+    q.open=lp!==null && change!==null ? lp-change : (q.open || mid);
+    if (!q.ready) { q.lo=q.bid; q.hi=q.ask; }
+    else { q.lo=Math.min(q.lo,q.bid); q.hi=Math.max(q.hi,q.ask); }
+    q.time=new Date(); q.ready=true;
+    Feed.emit();
+  }
 };
 
-// REAL FEED: replace the body of tick() with your WebSocket data.
-// For each message, set Q[sym].bid / .ask / .time, update .lo/.hi, then call Feed.emit().
-function tick() {
-  const now = new Date();
-  MARKET.forEach(m => {
-    if (Math.random() > 0.65) return;                         // not every symbol moves every second
-    const q = Q[m.sym];
-    const mid = +(q.bid + (Math.random() - 0.5) * 2 * m.vol).toFixed(m.digits);
-    if (mid !== q.bid) q.dir = mid > q.bid ? 1 : -1;          // remember direction for colours
-    q.bid = mid;
-    q.ask = +(mid + m.spread * m.point).toFixed(m.digits);
-    q.lo = Math.min(q.lo, q.bid); q.hi = Math.max(q.hi, q.ask);
-    q.time = now;
-  });
-  Feed.emit();
-}
-setInterval(tick, 1000);
-
 // ---- 2d) Trading maths (simplified for a demo: leverage 1:100, USD account) ----
-const profitOf = p => {
+const profitOf = p => {\n  if (!Q[p.sym] || !Q[p.sym].ready) return 0;
   const m = MAP[p.sym], q = Q[p.sym];
   const closePx = p.side === 'buy' ? q.bid : q.ask;           // buys close at bid, sells at ask
   const diff = p.side === 'buy' ? closePx - p.price : p.price - closePx;
   const raw = diff * p.vol * m.contract;
   return m.usdBase ? raw / q.bid : raw;                       // convert to USD for USD-base pairs
 };
-const marginOf = p => {
+const marginOf = p => {\n  if (!Q[p.sym] || !Q[p.sym].ready) return 0;
   const m = MAP[p.sym], q = Q[p.sym];
   return (m.usdBase ? p.vol * m.contract : p.vol * m.contract * q.bid) / 100;
 };
