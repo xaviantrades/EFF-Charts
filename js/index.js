@@ -336,17 +336,7 @@ const URL =
     }
 
 
-    // =========================================
-    // 11. BUTTONS
-    // =========================================
-
-    document
-      .getElementById("connectBtn")
-      .addEventListener("click", connect);
-
-    document
-      .getElementById("disconnectBtn")
-      .addEventListener("click", disconnect);
+    
 
     renderPrices();
 
