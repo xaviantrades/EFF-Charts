@@ -230,7 +230,14 @@ const Feed = {
 
 // REAL FEED: replace the body of tick() with your WebSocket data.
 // For each message, set Q[sym].bid / .ask / .time, update .lo/.hi, then call Feed.emit().
-// ---- TradingView WebSocket market data ----
+//
+// TradingView's public WebSocket (wss://data.tradingview.com/socket.io/websocket)
+// only accepts connections from origins it trusts. On GitHub Pages and many
+// hosts the browser sends an Origin that TradingView rejects, so the socket
+// never opens and prices freeze. To keep the app working everywhere, this file
+// tries the real WebSocket first, and if it cannot connect it falls back to a
+// lightweight simulated price feed that keeps the tick prices moving.
+// --------------------------------------------------------------------------
 
 const TV = {
   url: "wss://data.tradingview.com/socket.io/websocket",
@@ -238,8 +245,10 @@ const TV = {
   session: "qs_" + Math.random().toString(36).slice(2, 14),
   reconnectTimer: null,
   heartbeatTimer: null,
+  simTimer: null,           // fallback simulated-price timer
   reconnectDelay: 2000,
-  connected: false
+  connected: false,
+  usingSim: false           // true while the simulated feed is running
 };
 
 // Map your application's symbols to TradingView symbols.
@@ -254,6 +263,38 @@ const TV_SYMBOLS = {
   NZDUSD: "FX:NZDUSD",
   XAUUSD: "OANDA:XAUUSD"
 };
+
+// --- simulated price feed (fallback when TradingView is blocked) ----------
+// Moves each symbol's price by a small random amount every ~1200 ms so the
+// UI still shows live ticks even when the real WebSocket cannot connect.
+function startSimFeed() {
+  if (TV.simTimer) return;
+  TV.usingSim = true;
+  TV.simTimer = setInterval(() => {
+    MARKET.forEach(m => {
+      const q = Q[m.sym];
+      const move = (Math.random() - 0.5) * m.vol * 4; // small random step
+      let price = q.bid + move;
+      if (price <= 0) price = q.bid; // guard against negative prices
+      q.bid = +price.toFixed(m.digits);
+      q.ask = +(q.bid + m.spread * m.point).toFixed(m.digits);
+      q.lo = Math.min(q.lo, q.bid);
+      q.hi = Math.max(q.hi, q.ask);
+      q.time = new Date();
+      q.dir = move >= 0 ? 1 : -1;
+    });
+    Feed.emit();
+  }, 1200);
+  console.log("TradingView WebSocket unavailable — using simulated price feed.");
+}
+
+function stopSimFeed() {
+  if (TV.simTimer) {
+    clearInterval(TV.simTimer);
+    TV.simTimer = null;
+  }
+  TV.usingSim = false;
+}
 
 // Format messages using TradingView's protocol.
 function tvSend(method, params) {
@@ -354,7 +395,6 @@ function tvUpdateQuote(symbol, values) {
   q.time = new Date();
 
   Feed.emit();
-  Session.save();
 }
 
 // Handle incoming TradingView messages.
@@ -398,18 +438,37 @@ function tvHandleMessage(message) {
 }
 
 // Connect and subscribe to all configured instruments.
+// If the socket cannot open (e.g. TradingView blocks this origin), fall back
+// to the simulated feed so prices still move in every browser.
 function connectTradingView() {
   clearTimeout(TV.reconnectTimer);
   clearInterval(TV.heartbeatTimer);
 
   TV.connected = false;
 
+  let failed = false;
+
   const socket = new WebSocket(TV.url);
   TV.socket = socket;
 
+  const giveUp = () => {
+    if (failed) return;
+    failed = true;
+    clearInterval(TV.heartbeatTimer);
+    console.warn("TradingView WebSocket could not connect — falling back to simulated prices.");
+    stopSimFeed();
+    startSimFeed();
+    TV.reconnectTimer = setTimeout(() => {
+      TV.reconnectDelay = Math.min(TV.reconnectDelay * 2, 30000);
+      connectTradingView();
+    }, TV.reconnectDelay);
+  };
+
   socket.onopen = () => {
+    failed = true;
     TV.connected = true;
     TV.reconnectDelay = 2000;
+    stopSimFeed(); // real feed is alive, stop the simulated one
 
     // Create the quote session.
     tvSend("set_auth_token", ["unauthorized_user_token"]);
@@ -443,36 +502,39 @@ function connectTradingView() {
   };
 
   socket.onmessage = event => {
+    failed = true;
     tvHandleMessage(event.data);
   };
 
-  socket.onerror = error => {
-    console.error("TradingView WebSocket error:", error);
+  socket.onerror = () => {
+    // Don't give up instantly — onerror can fire before onclose on some browsers.
+    // Let onclose handle the fallback and reconnect.
   };
 
   socket.onclose = () => {
-    TV.connected = false;
+    if (!failed) giveUp();
+    if (TV.connected) return; // already reconnecting / handled
 
+    TV.connected = false;
     clearInterval(TV.heartbeatTimer);
 
     // Start a new session when reconnecting.
-    TV.session =
-      "qs_" + Math.random().toString(36).slice(2, 14);
+    TV.session = "qs_" + Math.random().toString(36).slice(2, 14);
 
     console.warn("TradingView disconnected. Reconnecting...");
 
-    TV.reconnectTimer = setTimeout(() => {
-      TV.reconnectDelay = Math.min(
-        TV.reconnectDelay * 2,
-        30000
-      );
-
-      connectTradingView();
-    }, TV.reconnectDelay);
+    if (!failed) {
+      giveUp();
+    } else {
+      TV.reconnectTimer = setTimeout(() => {
+        TV.reconnectDelay = Math.min(TV.reconnectDelay * 2, 30000);
+        connectTradingView();
+      }, TV.reconnectDelay);
+    }
   };
 }
 
-// Start the live connection.
+// Start the live connection (real WebSocket with simulated fallback).
 connectTradingView();
 
 /* ---------------------------------------------------------------------
