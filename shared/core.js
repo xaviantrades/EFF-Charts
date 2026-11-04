@@ -229,162 +229,267 @@ const Feed = {
 };
 
 // ---- Yahoo Finance WebSocket market data ----
-// Yahoo sends JSON envelopes containing Base64-encoded protobuf pricing data.
+// Keep this endpoint and protocol aligned with the tested Yahoo reference page.
 const Yahoo = {
-  url: "wss://streamer.websocket.finance.yahoo.com",
+  url: "wss://streamer.finance.yahoo.com/?version=2",
   socket: null,
   reconnectTimer: null,
   heartbeatTimer: null,
-  reconnectDelay: 2000,
+  silenceTimer: null,
+  reconnectDelay: 5000,
   connected: false,
+  manualClose: false,
+  attempts: {},
+  lastTickAt: {},
+  ticks: {},
   subscriptions: [],
-  subscriptionInterval: 15000
+  subscriptionInterval: 15000,
+  silenceMs: 12000
 };
 
-// Map application instruments to Yahoo Finance symbols.
-// Yahoo FX symbols use the =X suffix. Gold uses Yahoo's XAUUSD=X quote where available.
-const YAHOO_SYMBOLS = {
-  EURUSD: "EURUSD=X",
-  GBPUSD: "GBPUSD=X",
-  USDJPY: "USDJPY=X",
-  USDCHF: "USDCHF=X",
-  USDCAD: "USDCAD=X",
-  AUDUSD: "AUDUSD=X",
-  NZDUSD: "NZDUSD=X",
-  XAUUSD: "XAUUSD=X"
+// Yahoo's FX symbols are not consistent: USD-base pairs commonly use
+// CHF=X, JPY=X and CAD=X rather than USDCHF=X, USDJPY=X and USDCAD=X.
+const YAHOO_CANDIDATES = {
+  EURUSD: ["EURUSD=X"],
+  GBPUSD: ["GBPUSD=X"],
+  USDJPY: ["JPY=X"],
+  USDCHF: ["CHF=X"],
+  USDCAD: ["CAD=X"],
+  AUDUSD: ["AUDUSD=X"],
+  NZDUSD: ["NZDUSD=X"],
+  XAUUSD: ["XAUUSD=X", "GC=F"]
 };
+const YAHOO_TO_APP = {};
+Object.keys(YAHOO_CANDIDATES).forEach(symbol => {
+  YAHOO_CANDIDATES[symbol].forEach(ticker => { YAHOO_TO_APP[ticker] = symbol; });
+  Yahoo.ticks[symbol] = 0;
+});
+Object.keys(YAHOO_CANDIDATES).forEach(symbol => {
+  Yahoo.subscriptions.push(YAHOO_CANDIDATES[symbol][0]);
+});
 
-// Decode a protobuf varint beginning at offset. Returns [value, nextOffset].
-function yahooReadVarint(bytes, offset) {
-  let value = 0;
-  let shift = 0;
-  while (offset < bytes.length && shift < 64) {
-    const byte = bytes[offset++];
-    value += (byte & 0x7f) * Math.pow(2, shift);
-    if ((byte & 0x80) === 0) return [value, offset];
-    shift += 7;
-  }
-  throw new Error("Invalid Yahoo protobuf varint");
-}
-
-// PricingData protobuf fields used here: field 1 = ticker ID (string),
-// field 2 = price (float/fixed32). Unknown fields are skipped safely.
+// Decode Yahoo's PricingData protobuf message. Field 1 is ticker ID,
+// field 2 price, 3 time, 8 change %, 10 high, 11 low, 12 change,
+// 15 open, 23 bid and 25 ask.
 function yahooDecodePricing(base64Message) {
   const binary = atob(base64Message);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const view = new DataView(bytes.buffer);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const decoder = new TextDecoder();
+  const result = {};
   let offset = 0;
-  let id = "";
-  let price = null;
+
+  function readVarint() {
+    let value = 0n;
+    let shift = 0n;
+    while (true) {
+      if (offset >= bytes.length || shift >= 70n) throw new Error("Invalid or truncated Yahoo varint");
+      const byte = bytes[offset++];
+      value |= BigInt(byte & 0x7f) << shift;
+      if (!(byte & 0x80)) return value;
+      shift += 7n;
+    }
+  }
 
   while (offset < bytes.length) {
-    const [tag, nextOffset] = yahooReadVarint(bytes, offset);
-    offset = nextOffset;
+    const tag = Number(readVarint());
     const field = tag >>> 3;
     const wire = tag & 7;
+    let value;
 
     if (wire === 0) {
-      const result = yahooReadVarint(bytes, offset);
-      offset = result[1];
+      const raw = readVarint();
+      value = Number(raw);
+      if (field === 3 || field === 9 || field === 24 || field === 26) {
+        value = Number((raw >> 1n) ^ -(raw & 1n));
+      }
     } else if (wire === 1) {
+      if (offset + 8 > bytes.length) throw new Error("Truncated Yahoo 64-bit field");
+      value = view.getFloat64(offset, true);
       offset += 8;
     } else if (wire === 2) {
-      const result = yahooReadVarint(bytes, offset);
-      const length = result[0];
-      offset = result[1];
-      if (offset + length > bytes.length) throw new Error("Truncated Yahoo protobuf field");
-      if (field === 1) id = new TextDecoder().decode(bytes.subarray(offset, offset + length));
+      const length = Number(readVarint());
+      if (length < 0 || offset + length > bytes.length) throw new Error("Truncated Yahoo text field");
+      value = decoder.decode(bytes.subarray(offset, offset + length));
       offset += length;
     } else if (wire === 5) {
-      if (offset + 4 > bytes.length) throw new Error("Truncated Yahoo protobuf float");
-      if (field === 2) price = view.getFloat32(offset, true);
+      if (offset + 4 > bytes.length) throw new Error("Truncated Yahoo float field");
+      value = view.getFloat32(offset, true);
       offset += 4;
     } else {
       throw new Error("Unsupported Yahoo protobuf wire type: " + wire);
     }
-    if (offset > bytes.length) throw new Error("Truncated Yahoo protobuf message");
-  }
 
-  return { id, price };
+    const fields = {
+      1: "id", 2: "price", 3: "time", 8: "changePercent",
+      10: "dayHigh", 11: "dayLow", 12: "change",
+      15: "openPrice", 23: "bid", 25: "ask"
+    };
+    if (fields[field]) result[fields[field]] = value;
+  }
+  return result;
 }
 
-// Yahoo messages arrive as JSON: { type: "pricing", message: "<base64 protobuf>" }.
-function yahooHandleMessage(rawMessage) {
-  let envelope;
-  try {
-    envelope = typeof rawMessage === "string" ? JSON.parse(rawMessage) : rawMessage;
-  } catch {
-    return;
-  }
-  if (!envelope || envelope.type !== "pricing" || typeof envelope.message !== "string") return;
+function yahooUpdateQuote(data) {
+  const symbol = YAHOO_TO_APP[data.id];
+  if (!symbol) return;
 
-  try {
-    const quote = yahooDecodePricing(envelope.message);
-    const symbol = Object.keys(YAHOO_SYMBOLS).find(key => YAHOO_SYMBOLS[key] === quote.id);
-    if (symbol && Number.isFinite(quote.price) && quote.price > 0) yahooUpdateQuote(symbol, quote.price);
-  } catch (error) {
-    console.warn("Could not decode Yahoo Finance price message:", error);
-  }
-}
+  const market = MAP[symbol];
+  const quote = Q[symbol];
+  const previousMid = (quote.bid + quote.ask) / 2;
+  const price = Number(data.price);
+  const bid = Number(data.bid);
+  const ask = Number(data.ask);
 
-// Apply a Yahoo last-traded price using the application's existing spread model.
-function yahooUpdateQuote(symbol, price) {
-  const m = MAP[symbol];
-  const q = Q[symbol];
-  if (!m || !q || !Number.isFinite(price) || price <= 0) return;
+  if (Number.isFinite(bid) && bid > 0) quote.bid = bid;
+  else if (Number.isFinite(price) && price > 0) quote.bid = price;
+  if (Number.isFinite(ask) && ask > 0) quote.ask = ask;
+  else quote.ask = quote.bid + market.spread * market.point;
 
-  const previous = q.bid;
-  q.bid = +price.toFixed(m.digits);
-  q.ask = +(q.bid + m.spread * m.point).toFixed(m.digits);
+  quote.bid = +quote.bid.toFixed(market.digits);
+  quote.ask = +quote.ask.toFixed(market.digits);
+  const mid = (quote.bid + quote.ask) / 2;
+  if (Math.abs(mid - previousMid) > 1e-12) quote.dir = mid > previousMid ? 1 : -1;
 
-  if (q.bid !== previous) q.dir = q.bid > previous ? 1 : -1;
-  q.lo = Math.min(q.lo, q.bid);
-  q.hi = Math.max(q.hi, q.ask);
-  q.time = new Date();
+  if (Number(data.openPrice) > 0) quote.open = Number(data.openPrice);
+  if (Number(data.dayHigh) > 0) quote.hi = Number(data.dayHigh);
+  else quote.hi = quote.hi == null ? quote.ask : Math.max(quote.hi, quote.ask);
+  if (Number(data.dayLow) > 0) quote.lo = Number(data.dayLow);
+  else quote.lo = quote.lo == null ? quote.bid : Math.min(quote.lo, quote.bid);
+
+  quote.time = Number(data.time) > 0 ? new Date(Number(data.time)) : new Date();
+  Yahoo.lastTickAt[symbol] = Date.now();
+  Yahoo.ticks[symbol] = (Yahoo.ticks[symbol] || 0) + 1;
 
   Feed.emit();
   Session.save();
 }
 
-function yahooSendSubscriptions() {
-  if (!Yahoo.socket || Yahoo.socket.readyState !== WebSocket.OPEN || !Yahoo.subscriptions.length) return;
-  Yahoo.socket.send(JSON.stringify({ subscribe: Yahoo.subscriptions }));
+function yahooHandleMessage(raw) {
+  let envelope;
+  try {
+    envelope = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (error) {
+    console.warn("Yahoo sent a non-JSON frame:", error);
+    return;
+  }
+  if (!envelope || envelope.type !== "pricing" || typeof envelope.message !== "string") return;
+
+  try {
+    yahooUpdateQuote(yahooDecodePricing(envelope.message));
+  } catch (error) {
+    console.warn("Could not decode Yahoo Finance pricing message:", error);
+  }
+}
+
+function yahooSendSubscriptions(tickers) {
+  const socket = Yahoo.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  const symbols = tickers || Object.keys(YAHOO_CANDIDATES).map(symbol => {
+    const index = Yahoo.attempts[symbol] || 0;
+    return YAHOO_CANDIDATES[symbol][index];
+  });
+  socket.send(JSON.stringify({ subscribe: symbols }));
+  return true;
+}
+
+function yahooTryNextCandidate(symbol) {
+  const candidates = YAHOO_CANDIDATES[symbol];
+  const next = (Yahoo.attempts[symbol] || 0) + 1;
+  if (!candidates || next >= candidates.length) return;
+  Yahoo.attempts[symbol] = next;
+  const ticker = candidates[next];
+  Yahoo.lastTickAt[symbol] = Date.now();
+  console.warn("No Yahoo ticks for " + symbol + "; trying " + ticker);
+  yahooSendSubscriptions([ticker]);
+}
+
+function yahooCheckSilence() {
+  const now = Date.now();
+  Object.keys(YAHOO_CANDIDATES).forEach(symbol => {
+    const last = Yahoo.lastTickAt[symbol] || Yahoo.openedAt || now;
+    if (!Yahoo.ticks[symbol] && now - last > Yahoo.silenceMs) yahooTryNextCandidate(symbol);
+  });
 }
 
 function connectYahoo() {
   clearTimeout(Yahoo.reconnectTimer);
   clearInterval(Yahoo.heartbeatTimer);
-  Yahoo.connected = false;
+  clearInterval(Yahoo.silenceTimer);
+  if (Yahoo.socket && (Yahoo.socket.readyState === WebSocket.OPEN || Yahoo.socket.readyState === WebSocket.CONNECTING)) return;
 
-  const socket = new WebSocket(Yahoo.url);
-  Yahoo.socket = socket;
+  Yahoo.manualClose = false;
+  Yahoo.attempts = {};
+  Yahoo.lastTickAt = {};
+  Object.keys(Yahoo.ticks).forEach(symbol => { Yahoo.ticks[symbol] = 0; });
 
-  socket.onopen = () => {
+  let socket;
+  try {
+    socket = new WebSocket(Yahoo.url);
+    Yahoo.socket = socket;
+  } catch (error) {
+    console.error("Could not create Yahoo Finance WebSocket:", error);
+    yahooScheduleReconnect();
+    return;
+  }
+
+  socket.addEventListener("open", () => {
+    if (Yahoo.socket !== socket) return;
     Yahoo.connected = true;
-    Yahoo.reconnectDelay = 2000;
+    Yahoo.openedAt = Date.now();
+    Yahoo.reconnectDelay = 5000;
     yahooSendSubscriptions();
-    // Yahoo expects periodic subscription refreshes to keep the stream alive.
-    Yahoo.heartbeatTimer = setInterval(yahooSendSubscriptions, Yahoo.subscriptionInterval);
-    console.log("Yahoo Finance WebSocket connected.");
-  };
+    Yahoo.heartbeatTimer = setInterval(() => yahooSendSubscriptions(), Yahoo.subscriptionInterval);
+    Yahoo.silenceTimer = setInterval(yahooCheckSilence, 3000);
+    console.log("Yahoo Finance WebSocket connected:", Yahoo.url);
+  });
 
-  socket.onmessage = event => yahooHandleMessage(event.data);
-  socket.onerror = error => console.error("Yahoo Finance WebSocket error:", error);
+  socket.addEventListener("message", event => {
+    if (Yahoo.socket === socket) yahooHandleMessage(event.data);
+  });
 
-  socket.onclose = () => {
+  socket.addEventListener("error", event => {
+    // Browsers intentionally expose little detail in WebSocket error events.
+    console.error("Yahoo Finance WebSocket error; inspect the Network > WS entry for the close/handshake reason.", event);
+  });
+
+  socket.addEventListener("close", event => {
+    if (Yahoo.socket !== socket) return;
+    Yahoo.socket = null;
     Yahoo.connected = false;
     clearInterval(Yahoo.heartbeatTimer);
-    console.warn("Yahoo Finance disconnected. Reconnecting...");
-    Yahoo.reconnectTimer = setTimeout(() => {
-      Yahoo.reconnectDelay = Math.min(Yahoo.reconnectDelay * 2, 30000);
-      connectYahoo();
-    }, Yahoo.reconnectDelay);
-  };
+    clearInterval(Yahoo.silenceTimer);
+    console.warn("Yahoo Finance WebSocket closed:", event.code, event.reason || "(no reason)");
+    yahooScheduleReconnect();
+  });
 }
 
-// Start the Yahoo live feed for the same instruments used by the application.
-Yahoo.subscriptions = Object.values(YAHOO_SYMBOLS);
+function yahooScheduleReconnect() {
+  if (Yahoo.manualClose || Yahoo.reconnectTimer) return;
+  const delay = Yahoo.reconnectDelay;
+  Yahoo.reconnectTimer = setTimeout(() => {
+    Yahoo.reconnectTimer = null;
+    Yahoo.reconnectDelay = Math.min(Yahoo.reconnectDelay * 2, 30000);
+    connectYahoo();
+  }, delay);
+}
+
+function disconnectYahoo() {
+  Yahoo.manualClose = true;
+  clearTimeout(Yahoo.reconnectTimer);
+  clearInterval(Yahoo.heartbeatTimer);
+  clearInterval(Yahoo.silenceTimer);
+  Yahoo.reconnectTimer = null;
+  if (Yahoo.socket) {
+    const socket = Yahoo.socket;
+    Yahoo.socket = null;
+    socket.close();
+  }
+  Yahoo.connected = false;
+}
+
+// Start the live feed for the instruments already configured in MARKET.
 connectYahoo();
 /* ---------------------------------------------------------------------
    2e) SESSION  (NEW - keeps State alive when moving between html pages)
