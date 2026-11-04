@@ -540,6 +540,18 @@ function disconnectYahoo() {
   Yahoo.connected = false;
 }
 
+// Small read-only diagnostic hook for browser-console troubleshooting.
+window.KileleFeedDebug = () => ({
+  endpoint: Yahoo.url,
+  connected: Yahoo.connected,
+  socketState: Yahoo.socket ? Yahoo.socket.readyState : WebSocket.CLOSED,
+  frames: Yahoo.frameCount,
+  decodeErrors: Yahoo.decodeErrors,
+  unknownSymbols: Yahoo.unknownSymbols,
+  ticks: { ...Yahoo.ticks },
+  lastFrameAt: Yahoo.lastFrameAt ? new Date(Yahoo.lastFrameAt).toISOString() : null
+});
+
 // Recover after mobile browsers suspend or drop a background connection.
 window.addEventListener("online", () => {
   if (!Yahoo.socket || Yahoo.socket.readyState === WebSocket.CLOSED) connectYahoo();
