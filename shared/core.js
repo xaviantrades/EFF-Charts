@@ -375,6 +375,8 @@ function yahooUpdateQuote(data) {
 
   if (Number.isFinite(bid) && bid > 0) quote.bid = bid;
   else if (Number.isFinite(price) && price > 0) quote.bid = price;
+  else if (Number.isFinite(ask) && ask > 0) quote.bid = ask - market.spread * market.point;
+
   if (Number.isFinite(ask) && ask > 0) quote.ask = ask;
   else quote.ask = quote.bid + market.spread * market.point;
 
@@ -410,6 +412,7 @@ function yahooHandleMessage(raw) {
   try {
     yahooUpdateQuote(yahooDecodePricing(envelope.message));
   } catch (error) {
+    Yahoo.decodeErrors++;
     console.warn("Could not decode Yahoo Finance pricing message:", error);
   }
 }
