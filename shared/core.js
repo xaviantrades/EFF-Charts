@@ -224,131 +224,121 @@ const log = msg => State.journal.unshift({ t: new Date(), msg });
 // ---- 2c) The FEED: pages subscribe to be told when prices change ----
 const Feed = {
   subs: new Set(),
-  on(fn)  { this.subs.add(fn); return () => this.subs.delete(fn); }, // returns an "unsubscribe" function
+  on(fn)  { this.subs.add(fn); return () => this.subs.delete(fn); },
   emit()  { this.subs.forEach(fn => fn()); }
 };
 
-// REAL FEED: replace the body of tick() with your WebSocket data.
-// For each message, set Q[sym].bid / .ask / .time, update .lo/.hi, then call Feed.emit().
-// ---- TradingView WebSocket market data ----
-
-const TV = {
-  url: "wss://data.tradingview.com/socket.io/websocket",
+// ---- Yahoo Finance WebSocket market data ----
+// Yahoo sends JSON envelopes containing Base64-encoded protobuf pricing data.
+const Yahoo = {
+  url: "wss://streamer.websocket.finance.yahoo.com",
   socket: null,
-  session: "qs_" + Math.random().toString(36).slice(2, 14),
   reconnectTimer: null,
   heartbeatTimer: null,
   reconnectDelay: 2000,
-  connected: false
+  connected: false,
+  subscriptions: [],
+  subscriptionInterval: 15000
 };
 
-// Map your application's symbols to TradingView symbols.
-// Verify each symbol in TradingView before relying on its data.
-const TV_SYMBOLS = {
-  EURUSD: "FX:EURUSD",
-  GBPUSD: "FX:GBPUSD",
-  USDJPY: "FX:USDJPY",
-  USDCHF: "FX:USDCHF",
-  USDCAD: "FX:USDCAD",
-  AUDUSD: "FX:AUDUSD",
-  NZDUSD: "FX:NZDUSD",
-  XAUUSD: "OANDA:XAUUSD"
+// Map application instruments to Yahoo Finance symbols.
+// Yahoo FX symbols use the =X suffix. Gold uses Yahoo's XAUUSD=X quote where available.
+const YAHOO_SYMBOLS = {
+  EURUSD: "EURUSD=X",
+  GBPUSD: "GBPUSD=X",
+  USDJPY: "USDJPY=X",
+  USDCHF: "USDCHF=X",
+  USDCAD: "USDCAD=X",
+  AUDUSD: "AUDUSD=X",
+  NZDUSD: "NZDUSD=X",
+  XAUUSD: "XAUUSD=X"
 };
 
-// Format messages using TradingView's protocol.
-function tvSend(method, params) {
-  if (!TV.socket || TV.socket.readyState !== WebSocket.OPEN) {
+// Decode a protobuf varint beginning at offset. Returns [value, nextOffset].
+function yahooReadVarint(bytes, offset) {
+  let value = 0;
+  let shift = 0;
+  while (offset < bytes.length && shift < 64) {
+    const byte = bytes[offset++];
+    value += (byte & 0x7f) * Math.pow(2, shift);
+    if ((byte & 0x80) === 0) return [value, offset];
+    shift += 7;
+  }
+  throw new Error("Invalid Yahoo protobuf varint");
+}
+
+// PricingData protobuf fields used here: field 1 = ticker ID (string),
+// field 2 = price (float/fixed32). Unknown fields are skipped safely.
+function yahooDecodePricing(base64Message) {
+  const binary = atob(base64Message);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const view = new DataView(bytes.buffer);
+  let offset = 0;
+  let id = "";
+  let price = null;
+
+  while (offset < bytes.length) {
+    const [tag, nextOffset] = yahooReadVarint(bytes, offset);
+    offset = nextOffset;
+    const field = tag >>> 3;
+    const wire = tag & 7;
+
+    if (wire === 0) {
+      const result = yahooReadVarint(bytes, offset);
+      offset = result[1];
+    } else if (wire === 1) {
+      offset += 8;
+    } else if (wire === 2) {
+      const result = yahooReadVarint(bytes, offset);
+      const length = result[0];
+      offset = result[1];
+      if (offset + length > bytes.length) throw new Error("Truncated Yahoo protobuf field");
+      if (field === 1) id = new TextDecoder().decode(bytes.subarray(offset, offset + length));
+      offset += length;
+    } else if (wire === 5) {
+      if (offset + 4 > bytes.length) throw new Error("Truncated Yahoo protobuf float");
+      if (field === 2) price = view.getFloat32(offset, true);
+      offset += 4;
+    } else {
+      throw new Error("Unsupported Yahoo protobuf wire type: " + wire);
+    }
+    if (offset > bytes.length) throw new Error("Truncated Yahoo protobuf message");
+  }
+
+  return { id, price };
+}
+
+// Yahoo messages arrive as JSON: { type: "pricing", message: "<base64 protobuf>" }.
+function yahooHandleMessage(rawMessage) {
+  let envelope;
+  try {
+    envelope = typeof rawMessage === "string" ? JSON.parse(rawMessage) : rawMessage;
+  } catch {
     return;
   }
+  if (!envelope || envelope.type !== "pricing" || typeof envelope.message !== "string") return;
 
-  const payload = JSON.stringify({
-    m: method,
-    p: params
-  });
-
-  TV.socket.send(`~m~${payload.length}~m~${payload}`);
-}
-
-// Parse TradingView's framed messages.
-// A single WebSocket message can contain multiple frames.
-function tvParseFrames(message) {
-  const frames = [];
-  let position = 0;
-
-  while (position < message.length) {
-    if (message.startsWith("~h~", position)) {
-      const end = message.indexOf("~m~", position);
-
-      // Heartbeat frame.
-      if (end === -1) {
-        frames.push({
-          heartbeat: message.slice(position + 3)
-        });
-        break;
-      }
-
-      frames.push({
-        heartbeat: message.slice(position + 3, end)
-      });
-
-      position = end;
-      continue;
-    }
-
-    if (!message.startsWith("~m~", position)) {
-      break;
-    }
-
-    const lengthStart = position + 3;
-    const lengthEnd = message.indexOf("~m~", lengthStart);
-
-    if (lengthEnd === -1) break;
-
-    const length = Number(message.slice(lengthStart, lengthEnd));
-
-    if (!Number.isFinite(length) || length < 0) break;
-
-    const payloadStart = lengthEnd + 3;
-    const payloadEnd = payloadStart + length;
-
-    if (payloadEnd > message.length) break;
-
-    frames.push({
-      payload: message.slice(payloadStart, payloadEnd)
-    });
-
-    position = payloadEnd;
+  try {
+    const quote = yahooDecodePricing(envelope.message);
+    const symbol = Object.keys(YAHOO_SYMBOLS).find(key => YAHOO_SYMBOLS[key] === quote.id);
+    if (symbol && Number.isFinite(quote.price) && quote.price > 0) yahooUpdateQuote(symbol, quote.price);
+  } catch (error) {
+    console.warn("Could not decode Yahoo Finance price message:", error);
   }
-
-  return frames;
 }
 
-// Apply an incoming price to the application's quote object.
-function tvUpdateQuote(symbol, values) {
+// Apply a Yahoo last-traded price using the application's existing spread model.
+function yahooUpdateQuote(symbol, price) {
   const m = MAP[symbol];
   const q = Q[symbol];
-
-  if (!m || !q || !values) return;
-
-  // TradingView's last price is not necessarily a bid.
-  const price = Number(values.lp);
-
-  if (!Number.isFinite(price) || price <= 0) return;
+  if (!m || !q || !Number.isFinite(price) || price <= 0) return;
 
   const previous = q.bid;
-
-  // Approximate bid/ask around the last price using your
-  // configured spread. These are NOT verified broker quotes.
   q.bid = +price.toFixed(m.digits);
+  q.ask = +(q.bid + m.spread * m.point).toFixed(m.digits);
 
-  q.ask = +(
-    q.bid + m.spread * m.point
-  ).toFixed(m.digits);
-
-  if (q.bid !== previous) {
-    q.dir = q.bid > previous ? 1 : -1;
-  }
-
+  if (q.bid !== previous) q.dir = q.bid > previous ? 1 : -1;
   q.lo = Math.min(q.lo, q.bid);
   q.hi = Math.max(q.hi, q.ask);
   q.time = new Date();
@@ -357,124 +347,45 @@ function tvUpdateQuote(symbol, values) {
   Session.save();
 }
 
-// Handle incoming TradingView messages.
-function tvHandleMessage(message) {
-  for (const frame of tvParseFrames(message)) {
-    if (frame.heartbeat !== undefined) {
-      // Reply to TradingView heartbeat.
-      if (TV.socket && TV.socket.readyState === WebSocket.OPEN) {
-        const heartbeat = `~h~${frame.heartbeat}`;
-        TV.socket.send(`~m~${heartbeat.length}~m~${heartbeat}`);
-      }
-
-      continue;
-    }
-
-    if (!frame.payload) continue;
-
-    let data;
-
-    try {
-      data = JSON.parse(frame.payload);
-    } catch {
-      continue;
-    }
-
-    if (data.m === "qsd") {
-      const quote = data.p?.[1];
-
-      if (!quote || !quote.n || !quote.v) continue;
-
-      // Find the application symbol matching the subscription.
-      const symbol = Object.keys(TV_SYMBOLS).find(
-        key => TV_SYMBOLS[key] === quote.n
-      );
-
-      if (symbol) {
-        tvUpdateQuote(symbol, quote.v);
-      }
-    }
-  }
+function yahooSendSubscriptions() {
+  if (!Yahoo.socket || Yahoo.socket.readyState !== WebSocket.OPEN || !Yahoo.subscriptions.length) return;
+  Yahoo.socket.send(JSON.stringify({ subscribe: Yahoo.subscriptions }));
 }
 
-// Connect and subscribe to all configured instruments.
-function connectTradingView() {
-  clearTimeout(TV.reconnectTimer);
-  clearInterval(TV.heartbeatTimer);
+function connectYahoo() {
+  clearTimeout(Yahoo.reconnectTimer);
+  clearInterval(Yahoo.heartbeatTimer);
+  Yahoo.connected = false;
 
-  TV.connected = false;
-
-  const socket = new WebSocket(TV.url);
-  TV.socket = socket;
+  const socket = new WebSocket(Yahoo.url);
+  Yahoo.socket = socket;
 
   socket.onopen = () => {
-    TV.connected = true;
-    TV.reconnectDelay = 2000;
-
-    // Create the quote session.
-    tvSend("set_auth_token", ["unauthorized_user_token"]);
-
-    tvSend("set_locale", ["en", "US"]);
-
-    tvSend("quote_create_session", [TV.session]);
-
-    // Request fields needed by the application.
-    tvSend("quote_set_fields", [
-      TV.session,
-      "lp",
-      "bid",
-      "ask",
-      "ch",
-      "chp",
-      "short_name",
-      "exchange",
-      "description"
-    ]);
-
-    // Subscribe to each configured instrument.
-    Object.values(TV_SYMBOLS).forEach(symbol => {
-      tvSend("quote_add_symbols", [
-        TV.session,
-        symbol
-      ]);
-    });
-
-    console.log("TradingView WebSocket connected.");
+    Yahoo.connected = true;
+    Yahoo.reconnectDelay = 2000;
+    yahooSendSubscriptions();
+    // Yahoo expects periodic subscription refreshes to keep the stream alive.
+    Yahoo.heartbeatTimer = setInterval(yahooSendSubscriptions, Yahoo.subscriptionInterval);
+    console.log("Yahoo Finance WebSocket connected.");
   };
 
-  socket.onmessage = event => {
-    tvHandleMessage(event.data);
-  };
-
-  socket.onerror = error => {
-    console.error("TradingView WebSocket error:", error);
-  };
+  socket.onmessage = event => yahooHandleMessage(event.data);
+  socket.onerror = error => console.error("Yahoo Finance WebSocket error:", error);
 
   socket.onclose = () => {
-    TV.connected = false;
-
-    clearInterval(TV.heartbeatTimer);
-
-    // Start a new session when reconnecting.
-    TV.session =
-      "qs_" + Math.random().toString(36).slice(2, 14);
-
-    console.warn("TradingView disconnected. Reconnecting...");
-
-    TV.reconnectTimer = setTimeout(() => {
-      TV.reconnectDelay = Math.min(
-        TV.reconnectDelay * 2,
-        30000
-      );
-
-      connectTradingView();
-    }, TV.reconnectDelay);
+    Yahoo.connected = false;
+    clearInterval(Yahoo.heartbeatTimer);
+    console.warn("Yahoo Finance disconnected. Reconnecting...");
+    Yahoo.reconnectTimer = setTimeout(() => {
+      Yahoo.reconnectDelay = Math.min(Yahoo.reconnectDelay * 2, 30000);
+      connectYahoo();
+    }, Yahoo.reconnectDelay);
   };
 }
 
-// Start the live connection.
-connectTradingView();
-
+// Start the Yahoo live feed for the same instruments used by the application.
+Yahoo.subscriptions = Object.values(YAHOO_SYMBOLS);
+connectYahoo();
 /* ---------------------------------------------------------------------
    2e) SESSION  (NEW - keeps State alive when moving between html pages)
    ---------------------------------------------------------------------
