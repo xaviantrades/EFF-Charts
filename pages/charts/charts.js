@@ -16,6 +16,12 @@
 /* ---------------------------------------------------------------------
    2) THE PAGE DESCRIPTION
    --------------------------------------------------------------------- */
+// TradingView interval values supported by the timeframe picker.
+const TF = {
+  '1': '1', '5': '5', '15': '15', '30': '30',
+  '60': '60', '240': '240', 'D': 'D', 'W': 'W', 'M': 'M'
+};
+
 const PAGE = (() => {
   // chart  = the library's chart object        series = the candle series inside it
   // cur    = the candle that is forming NOW    off    = Feed unsubscribe handle
@@ -96,16 +102,6 @@ iframe.style.border = 'none';
     };
 
     container.appendChild(iframe);
-},
-
-unmount() {
-    if (off) off();
-    off = null;
-
-    if (chart) {
-        chart.remove();
-        chart = null;
-    }
 },
 
     // Runs when the page redraws or closes: stop listening and free the chart's memory

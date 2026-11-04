@@ -118,6 +118,7 @@ function hydrateIcons(root = document) {
 const MARKET = [
   {
     sym: "EURUSD",
+    price: 1.11990,
     exchange: "FX",
     name: "Euro vs US Dollar",
     digits: 5,
@@ -127,6 +128,7 @@ const MARKET = [
   },
   {
     sym: "GBPUSD",
+    price: 1.33708,
     exchange: "FX",
     name: "Great Britain Pound vs US Dollar",
     digits: 5,
@@ -136,6 +138,7 @@ const MARKET = [
   },
   {
     sym: "USDJPY",
+    price: 157.003,
     exchange: "FX",
     name: "US Dollar vs Japanese Yen",
     digits: 3,
@@ -145,6 +148,7 @@ const MARKET = [
   },
   {
     sym: "USDCHF",
+    price: 0.82218,
     exchange: "FX",
     name: "US Dollar vs Swiss Franc",
     digits: 5,
@@ -154,6 +158,7 @@ const MARKET = [
   },
   {
     sym: "USDCAD",
+    price: 1.40362,
     exchange: "FX",
     name: "US Dollar vs Canadian Dollar",
     digits: 5,
@@ -163,6 +168,7 @@ const MARKET = [
   },
   {
     sym: "AUDUSD",
+    price: 0.70078,
     exchange: "FX",
     name: "Australian Dollar vs US Dollar",
     digits: 5,
@@ -172,6 +178,7 @@ const MARKET = [
   },
   {
     sym: "NZDUSD",
+    price: 0.56781,
     exchange: "FX",
     name: "New Zealand Dollar vs US Dollar",
     digits: 5,
@@ -181,6 +188,7 @@ const MARKET = [
   },
   {
     sym: "XAUUSD",
+    price: 2650.00,
     exchange: "OANDA",
     name: "Gold vs US Dollar",
     digits: 2,
@@ -225,7 +233,14 @@ const log = msg => State.journal.unshift({ t: new Date(), msg });
 const Feed = {
   subs: new Set(),
   on(fn)  { this.subs.add(fn); return () => this.subs.delete(fn); },
-  emit()  { this.subs.forEach(fn => fn()); }
+  emit()  {
+    // A page listener must never prevent the other listeners or the quote
+    // persistence step from running when one renderer throws.
+    this.subs.forEach(fn => {
+      try { fn(); }
+      catch (error) { console.error("Live feed subscriber failed:", error); }
+    });
+  }
 };
 
 // ---- Yahoo Finance WebSocket market data ----
@@ -244,7 +259,12 @@ const Yahoo = {
   ticks: {},
   subscriptions: [],
   subscriptionInterval: 15000,
-  silenceMs: 12000
+  silenceMs: 12000,
+  frameSilenceMs: 45000,
+  lastFrameAt: 0,
+  frameCount: 0,
+  decodeErrors: 0,
+  unknownSymbols: 0
 };
 
 // Yahoo's FX symbols are not consistent: USD-base pairs commonly use
@@ -333,7 +353,11 @@ function yahooDecodePricing(base64Message) {
 
 function yahooUpdateQuote(data) {
   const symbol = YAHOO_TO_APP[data.id];
-  if (!symbol) return;
+  if (!symbol) {
+    Yahoo.unknownSymbols++;
+    if (Yahoo.unknownSymbols <= 5) console.warn("Yahoo sent an unrecognised ticker:", data.id);
+    return;
+  }
 
   const market = MAP[symbol];
   const quote = Q[symbol];
@@ -341,9 +365,18 @@ function yahooUpdateQuote(data) {
   const price = Number(data.price);
   const bid = Number(data.bid);
   const ask = Number(data.ask);
+  const hasPrice = (Number.isFinite(price) && price > 0) ||
+    (Number.isFinite(bid) && bid > 0) ||
+    (Number.isFinite(ask) && ask > 0);
+  if (!hasPrice) {
+    console.warn("Yahoo pricing frame did not contain a usable price:", data);
+    return;
+  }
 
   if (Number.isFinite(bid) && bid > 0) quote.bid = bid;
   else if (Number.isFinite(price) && price > 0) quote.bid = price;
+  else if (Number.isFinite(ask) && ask > 0) quote.bid = ask - market.spread * market.point;
+
   if (Number.isFinite(ask) && ask > 0) quote.ask = ask;
   else quote.ask = quote.bid + market.spread * market.point;
 
@@ -379,6 +412,7 @@ function yahooHandleMessage(raw) {
   try {
     yahooUpdateQuote(yahooDecodePricing(envelope.message));
   } catch (error) {
+    Yahoo.decodeErrors++;
     console.warn("Could not decode Yahoo Finance pricing message:", error);
   }
 }
@@ -407,6 +441,18 @@ function yahooTryNextCandidate(symbol) {
 
 function yahooCheckSilence() {
   const now = Date.now();
+  // A socket can remain in OPEN state after the browser/network has stopped
+  // delivering frames. Refreshing the page used to be the only way to recover.
+  // Recycle that stale connection so the existing reconnect/backoff path runs.
+  if (Yahoo.connected && Yahoo.openedAt &&
+      now - (Yahoo.lastFrameAt || Yahoo.openedAt) > Yahoo.frameSilenceMs) {
+    console.warn("Yahoo feed has received no frames; reconnecting stale socket.");
+    if (Yahoo.socket && Yahoo.socket.readyState === WebSocket.OPEN) {
+      Yahoo.socket.close(4000, "No Yahoo frames received");
+    }
+    return;
+  }
+
   Object.keys(YAHOO_CANDIDATES).forEach(symbol => {
     const last = Yahoo.lastTickAt[symbol] || Yahoo.openedAt || now;
     if (!Yahoo.ticks[symbol] && now - last > Yahoo.silenceMs) yahooTryNextCandidate(symbol);
@@ -438,6 +484,8 @@ function connectYahoo() {
     if (Yahoo.socket !== socket) return;
     Yahoo.connected = true;
     Yahoo.openedAt = Date.now();
+    Yahoo.lastFrameAt = Yahoo.openedAt;
+    Yahoo.frameCount = 0;
     Yahoo.reconnectDelay = 5000;
     yahooSendSubscriptions();
     Yahoo.heartbeatTimer = setInterval(() => yahooSendSubscriptions(), Yahoo.subscriptionInterval);
@@ -446,7 +494,10 @@ function connectYahoo() {
   });
 
   socket.addEventListener("message", event => {
-    if (Yahoo.socket === socket) yahooHandleMessage(event.data);
+    if (Yahoo.socket !== socket) return;
+    Yahoo.lastFrameAt = Date.now();
+    Yahoo.frameCount++;
+    yahooHandleMessage(event.data);
   });
 
   socket.addEventListener("error", event => {
@@ -488,6 +539,33 @@ function disconnectYahoo() {
   }
   Yahoo.connected = false;
 }
+
+// Small read-only diagnostic hook for browser-console troubleshooting.
+window.KileleFeedDebug = () => ({
+  endpoint: Yahoo.url,
+  connected: Yahoo.connected,
+  socketState: Yahoo.socket ? Yahoo.socket.readyState : WebSocket.CLOSED,
+  frames: Yahoo.frameCount,
+  decodeErrors: Yahoo.decodeErrors,
+  unknownSymbols: Yahoo.unknownSymbols,
+  ticks: { ...Yahoo.ticks },
+  lastFrameAt: Yahoo.lastFrameAt ? new Date(Yahoo.lastFrameAt).toISOString() : null
+});
+
+// Recover after mobile browsers suspend or drop a background connection.
+window.addEventListener("online", () => {
+  if (!Yahoo.socket || Yahoo.socket.readyState === WebSocket.CLOSED) connectYahoo();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  const socket = Yahoo.socket;
+  if (!socket || socket.readyState === WebSocket.CLOSED) connectYahoo();
+  else if (socket.readyState === WebSocket.OPEN &&
+           Date.now() - (Yahoo.lastFrameAt || Yahoo.openedAt || 0) > Yahoo.frameSilenceMs) {
+    socket.close(4000, "Feed stale after tab became visible");
+  }
+});
+window.addEventListener("pagehide", disconnectYahoo);
 
 // Start the live feed for the instruments already configured in MARKET.
 connectYahoo();
