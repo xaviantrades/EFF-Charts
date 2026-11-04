@@ -22,7 +22,7 @@ shared/                       used by EVERY page
 
 pages/<name>/<name>.html|css|js     one folder per screen:
   quotes      watch-list with live prices (needs account)
-  charts      live candlestick chart (needs account; loads the chart library)
+  charts      embedded TradingView chart (needs account; TradingView supplies its own candles)
   trade       balance / equity / open positions (needs account)
   history     closed positions, orders, deals (needs account)
   messages    mailbox empty state, Register / Sign in
@@ -54,4 +54,5 @@ WHAT CHANGED, AND WHY
   turned into SVG by hydrateIcons().
 - Inline style="..." attributes were moved into the page css files.
 - The empty js/index.js from the old project is not needed and was removed.
-- The chart library is loaded only by the Charts page.
+- The Charts page currently embeds TradingView in an iframe. Its candles are supplied by TradingView; the Yahoo Finance WebSocket in shared/core.js updates the app's Quotes / Trade prices and order ticket, not the iframe's internal chart data.
+- The Yahoo feed reconnects when the browser reports network recovery, when a suspended tab becomes active with a stale socket, or when the socket stops delivering frames.
